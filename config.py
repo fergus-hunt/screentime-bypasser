@@ -8,10 +8,10 @@ import os
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Where downloaded media is stored. Defaults to ~/media on the Pi.
+# Where downloaded media is stored. Defaults to 'media' in the working directory.
 # Override with the MEDIA_DIR environment variable if you like.
 # ---------------------------------------------------------------------------
-MEDIA_DIR = Path(os.environ.get("MEDIA_DIR", Path.home() / "media")).expanduser()
+MEDIA_DIR = Path(os.environ.get("MEDIA_DIR", Path.cwd() / "media")).resolve()
 
 # ---------------------------------------------------------------------------
 # Local web server (for pulling files onto your client device over the LAN).
