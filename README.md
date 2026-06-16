@@ -13,15 +13,62 @@ media folder over the LAN so any client device can pull the files from a browser
 - Runs a lightweight web server so your phone or laptop can browse the media
   folder and download files with a tap — no client-side setup, no SSH keys.
 
-## Install (on the Pi)
+## Run it always-on with Docker (recommended)
+
+This is the easiest way to keep the server running 24/7 on your Pi. Docker
+bundles Python, ffmpeg and Chromium into one image, so there's nothing to
+install on the Pi except Docker itself.
+
+One-time, on the Pi:
+
+```bash
+# Install Docker (skip if you already have it)
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker "$USER"   # then log out/in so 'docker' works without sudo
+
+cd restriction-bypasser
+docker compose up -d --build       # build image + start the always-on server
+```
+
+That's it — the LAN server is now running and will **restart on boot and after
+crashes** (`restart: unless-stopped`). Find it from any device on your network at
+`http://<your-pi-ip>:8000/`.
+
+To **download something**, use the included helper (it runs inside the running
+container):
+
+```bash
+chmod +x grab          # one time
+./grab "https://youtu.be/..."                      # download a video
+./grab "https://www.reddit.com/r/.../comments/..."  # archive a Reddit thread
+./grab "https://youtu.be/..." --audio               # flags pass through to the app
+```
+
+Anything you grab appears immediately at `http://<your-pi-ip>:8000/`.
+Downloaded files live in `./media` on the Pi (a Docker volume), so they persist
+across rebuilds and you can browse them directly too.
+
+Everyday Docker commands:
+
+```bash
+docker compose ps             # is it running / healthy?
+docker compose logs -f        # watch server logs
+docker compose restart        # restart it
+docker compose down           # stop it (and disable always-on until next 'up')
+docker compose up -d --build  # rebuild after you change the code
+```
+
+## Install without Docker (on the Pi)
+
+If you'd rather not use Docker:
 
 ```bash
 cd restriction-bypasser
 bash setup.sh
 ```
 
-This installs `ffmpeg` and `yt-dlp` into a local `./venv`. Then activate it
-whenever you use the app:
+This installs `ffmpeg`, `yt-dlp` and headless Chromium into a local `./venv`.
+Then activate it whenever you use the app:
 
 ```bash
 source venv/bin/activate

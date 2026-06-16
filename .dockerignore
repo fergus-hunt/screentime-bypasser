@@ -1,0 +1,11 @@
+# Keep the build context (and image) small.
+media/
+venv/
+.venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+*.md
+reddit_credentials.env
+reddit_archive_sample.html

@@ -1,0 +1,33 @@
+services:
+  pi-media:
+    build: .
+    image: pi-media-grabber
+    container_name: pi-media
+
+    # Always on: starts on boot (if Docker starts on boot) and restarts after
+    # crashes. Stays up until you explicitly run `docker compose down`.
+    restart: unless-stopped
+
+    # Expose the LAN web server. Host port 8000 -> container 8000.
+    ports:
+      - "8000:8000"
+
+    # Persist downloaded media on the host, in ./media next to this file.
+    # Survives container rebuilds, and you can browse it directly on the Pi.
+    volumes:
+      - ./media:/data/media
+
+    environment:
+      MEDIA_DIR: /data/media
+      SERVER_PORT: "8000"
+      # Optional: cap video resolution to save space on the Pi.
+      MAX_HEIGHT: "1080"
+
+    # Helpful: a quick health check so `docker ps` shows the server is alive.
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# grab — download a YouTube/Reddit link into the always-on container.
+#
+# Usage:
+#   ./grab "https://youtu.be/..."                 # download video
+#   ./grab "https://reddit.com/r/.../comments/..." # archive a thread
+#   ./grab "https://youtu.be/..." --audio          # extra flags pass through
+#
+# The download runs inside the running pi-media container, so it shares the
+# same Chromium, ffmpeg and media volume as the always-on server. Whatever it
+# downloads immediately shows up at  http://<pi-ip>:8000/
+set -euo pipefail
+
+if [ "$#" -eq 0 ]; then
+  echo "Usage: ./grab \"<youtube-or-reddit-link>\" [extra app.py flags]"
+  exit 1
+fi
+
+CONTAINER="pi-media"
+
+# Make sure the always-on container is up before we exec into it.
+if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+  echo "The '$CONTAINER' container isn't running. Start it with:"
+  echo "    docker compose up -d"
+  exit 1
+fi
+
+# Run the download inside the container. All args are passed straight to app.py.
+docker exec "$CONTAINER" python app.py "$@"
