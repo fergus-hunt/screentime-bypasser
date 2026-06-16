@@ -26,8 +26,20 @@ from pathlib import Path
 
 import config
 
-# A descriptive UA is polite and avoids Reddit's stricter bot throttling.
-USER_AGENT = "pi-media-grabber/1.0 (personal offline archiver)"
+# Reddit now blocks requests that look like scripts (HTTP 403: Blocked).
+# Sending a full set of browser-like headers — not just a User-Agent — gets
+# past their basic bot detection for one-user-on-one-IP personal use.
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "identity",  # avoid gzip so we can json-decode directly
+    "Referer": "https://www.reddit.com/",
+    "Connection": "keep-alive",
+}
 
 POST_ID_RE = re.compile(r"/comments/([a-z0-9]+)", re.IGNORECASE)
 
@@ -37,30 +49,59 @@ def is_reddit_thread(url: str) -> bool:
     return "/comments/" in url and "reddit.com" in url
 
 
+def _json_urls(url: str) -> list[str]:
+    """
+    Build candidate JSON URLs to try, in order. Reddit sometimes blocks one
+    host but serves another, so we try a few variants before giving up.
+    """
+    path = url.split("?")[0].split("#")[0].rstrip("/")
+    path = re.sub(r"https?://(www\.|new\.|old\.)?reddit\.com", "", path)
+    if not path.startswith("/"):
+        path = "/" + path
+    return [
+        f"https://www.reddit.com{path}/.json?raw_json=1",
+        f"https://old.reddit.com{path}/.json?raw_json=1",
+    ]
+
+
 def _to_json_url(url: str) -> str:
-    """Normalise any reddit post URL to its old.reddit JSON form."""
-    # Strip query/fragment, force old.reddit, ensure single trailing .json
-    clean = url.split("?")[0].split("#")[0].rstrip("/")
-    clean = re.sub(r"https?://(www\.|new\.)?reddit\.com",
-                   "https://old.reddit.com", clean)
-    if not clean.startswith("http"):
-        clean = "https://old.reddit.com" + clean
-    return clean + "/.json"
+    """Primary JSON URL (kept for backwards compatibility / tests)."""
+    return _json_urls(url)[0]
 
 
 def _fetch_json(url: str, *, retries: int = 3):
-    """Fetch and parse JSON, with a couple of polite retries."""
+    """
+    Fetch and parse Reddit JSON. Tries multiple host variants with browser-like
+    headers and polite back-off. Raises a clear, actionable error if blocked.
+    """
+    candidates = _json_urls(url)
     last_err = None
-    for attempt in range(retries):
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
-            last_err = exc
-            # 429/5xx — back off and retry.
-            time.sleep(2 * (attempt + 1))
-    raise RuntimeError(f"Could not fetch Reddit JSON ({url}): {last_err}")
+    for candidate in candidates:
+        for attempt in range(retries):
+            try:
+                req = urllib.request.Request(candidate, headers=BROWSER_HEADERS)
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                last_err = exc
+                if exc.code in (429, 403):
+                    # Rate-limited or blocked — wait longer, then try again.
+                    time.sleep(3 * (attempt + 1))
+                    continue
+                break  # 404 etc. — no point retrying this host
+            except (urllib.error.URLError, TimeoutError) as exc:
+                last_err = exc
+                time.sleep(2 * (attempt + 1))
+
+    raise RuntimeError(
+        f"Reddit refused the request ({last_err}).\n"
+        "  Reddit blocks automated access fairly aggressively. Things to try:\n"
+        "    • Wait a minute and run it again (you may be briefly rate-limited).\n"
+        "    • Make sure your Pi's clock is correct (sudo timedatectl).\n"
+        "    • If it persists, Reddit may be blocking your IP for unauthenticated\n"
+        "      access; using a Reddit API token is the robust long-term fix\n"
+        "      (ask and I can add OAuth support)."
+    )
 
 
 def _fmt_time(epoch: float | None) -> str:
