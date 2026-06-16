@@ -1,0 +1,25 @@
+# Optional: run the LAN web server automatically on boot.
+#
+# 1. Edit the paths below to match where you cloned this (and your username).
+# 2. sudo cp pi-media-server.service /etc/systemd/system/
+# 3. sudo systemctl daemon-reload
+# 4. sudo systemctl enable --now pi-media-server
+#
+# The server stays up and serves whatever you download; you still run
+# `python app.py <link>` from the CLI to add new media.
+
+[Unit]
+Description=Pi Media Grabber LAN server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/restriction-bypasser
+ExecStart=/home/pi/restriction-bypasser/venv/bin/python app.py --serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
