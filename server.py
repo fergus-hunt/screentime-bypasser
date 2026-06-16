@@ -54,10 +54,13 @@ class MediaHandler(SimpleHTTPRequestHandler):
         for e in entries:
             name = html.escape(e.name)
             size = _human_size(e.stat().st_size)
-            rows.append(
-                f'<tr><td><a href="{name}" download>{name}</a></td>'
-                f'<td class="size">{size}</td></tr>'
-            )
+            # Archived Reddit threads (.html) open in the browser to read;
+            # everything else is offered as a download.
+            if e.name.lower().endswith((".html", ".htm")):
+                link = f'<a href="{name}">📄 {name}</a>'
+            else:
+                link = f'<a href="{name}" download>{name}</a>'
+            rows.append(f'<tr><td>{link}</td><td class="size">{size}</td></tr>')
 
         body = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">

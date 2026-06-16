@@ -24,6 +24,7 @@ from pathlib import Path
 
 import config
 import downloader
+import reddit_archiver
 import server
 
 
@@ -47,10 +48,29 @@ def _progress(d):
         sys.stdout.flush()
 
 
-def cmd_download(links: list[str], audio: bool, no_playlist: bool) -> list[Path]:
+def cmd_download(links: list[str], audio: bool, no_playlist: bool,
+                 force_media: bool = False) -> list[Path]:
     all_files: list[Path] = []
     for url in links:
         kind = downloader.classify(url)
+
+        # Reddit *comment threads* are archived as an offline, read-only HTML
+        # page (post + full comment tree). This is the friction-by-design path:
+        # you deliberately download a thread, then read the local copy.
+        # Pass --media to instead pull video from a Reddit video post.
+        if kind == "reddit" and reddit_archiver.is_reddit_thread(url) \
+                and not force_media and not audio:
+            print(f"\n[reddit:archive] {url}")
+            try:
+                out = reddit_archiver.archive(url)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ERROR: {exc}")
+                continue
+            size = _human_size(out.stat().st_size) if out.exists() else "?"
+            print(f"  saved offline page: {out.name}  ({size})")
+            all_files.append(out)
+            continue
+
         if kind == "other":
             print(f"! Not a recognised YouTube/Reddit link, trying anyway: {url}")
         else:
@@ -100,6 +120,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Extract audio as MP3 instead of downloading video.")
     p.add_argument("--no-playlist", action="store_true",
                    help="If a link points into a playlist, grab only that item.")
+    p.add_argument("--media", action="store_true",
+                   help="For a Reddit thread, download its video/media instead "
+                        "of archiving the thread as an offline page.")
     p.add_argument("--serve", action="store_true",
                    help="Start the local web server (after any downloads).")
     p.add_argument("--list", action="store_true",
@@ -121,7 +144,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.links:
-        files = cmd_download(args.links, args.audio, args.no_playlist)
+        files = cmd_download(args.links, args.audio, args.no_playlist,
+                             force_media=args.media)
         print(f"\nFinished. {len(files)} file(s) in {config.MEDIA_DIR}")
 
     if args.serve:

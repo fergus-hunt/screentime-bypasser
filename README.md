@@ -27,6 +27,29 @@ whenever you use the app:
 source venv/bin/activate
 ```
 
+## Reddit threads: offline, read-only archive
+
+When you give it a **Reddit comments link**, the app does *not* open Reddit — it
+downloads the whole thread (post + full comment tree) into a single, self-contained
+HTML file you read offline. This is deliberate friction: to read a thread you have
+to consciously archive it first, then open the local copy. No live feed, no
+infinite scroll, no voting — just the one thread you decided was worth it.
+
+```bash
+# Archive a Reddit thread for offline reading
+python app.py "https://www.reddit.com/r/node/comments/xcmqpd/..."
+
+# Then serve it and open it from any device (it opens in-browser to read)
+python app.py --serve
+```
+
+If a Reddit link is actually a *video* post and you want the video file instead
+of the thread, add `--media`:
+
+```bash
+python app.py "https://www.reddit.com/r/aww/comments/.../" --media
+```
+
 ## Usage
 
 ```bash
