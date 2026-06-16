@@ -35,6 +35,24 @@ HTML file you read offline. This is deliberate friction: to read a thread you ha
 to consciously archive it first, then open the local copy. No live feed, no
 infinite scroll, no voting — just the one thread you decided was worth it.
 
+### How it works (no Reddit account or API key needed)
+
+Reddit blocks plain scripted access (`HTTP 403: Blocked`) and its official API
+now needs an approved app. So instead, the archiver uses a **real headless
+browser** (Chromium via Playwright): it loads the thread the way a human would,
+expands all the comments, and saves the page. No login, no API key, no captcha.
+
+The only setup is installing Chromium once — `setup.sh` does this for you, or
+manually:
+
+```bash
+pip install playwright
+python -m playwright install chromium
+```
+
+On a Raspberry Pi the first archive may take a little longer while the browser
+starts up; subsequent ones are quicker.
+
 ```bash
 # Archive a Reddit thread for offline reading
 python app.py "https://www.reddit.com/r/node/comments/xcmqpd/..."
