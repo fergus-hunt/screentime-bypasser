@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import html
 import socket
+import urllib.parse
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
@@ -52,14 +53,16 @@ class MediaHandler(SimpleHTTPRequestHandler):
 
         rows = []
         for e in entries:
-            name = html.escape(e.name)
+            display = html.escape(e.name)              # safe to show as text
+            # URL-encode the href so spaces, brackets etc. don't 404.
+            href = urllib.parse.quote(e.name)
             size = _human_size(e.stat().st_size)
             # Archived Reddit threads (.html) open in the browser to read;
             # everything else is offered as a download.
             if e.name.lower().endswith((".html", ".htm")):
-                link = f'<a href="{name}">📄 {name}</a>'
+                link = f'<a href="{href}">📄 {display}</a>'
             else:
-                link = f'<a href="{name}" download>{name}</a>'
+                link = f'<a href="{href}" download>{display}</a>'
             rows.append(f'<tr><td>{link}</td><td class="size">{size}</td></tr>')
 
         body = f"""<!doctype html>
