@@ -452,11 +452,176 @@ def _slugify(text: str, maxlen: int = 80) -> str:
     return slug[:maxlen] or "reddit-thread"
 
 
+def _json_url(url: str) -> str:
+    """Reddit JSON endpoint for a thread, asking for the full comment tree."""
+    base = _old_reddit_url(url)
+    # raw_json=1 -> don't HTML-escape; limit=500 -> grab as many as possible.
+    return base + "/.json?raw_json=1&limit=500"
+
+
+def _browser_get_json(page, url: str):
+    """
+    Fetch a URL's JSON *through the browser context* (so it carries real browser
+    headers/cookies and isn't bot-blocked like a plain script request). Returns
+    the parsed object, or None on failure.
+    """
+    import json
+    target = _json_url(url)
+    try:
+        resp = page.request.get(target, timeout=45000)
+        if not resp.ok:
+            return None
+        return json.loads(resp.text())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _parse_listing_json(data: dict, post_url: str) -> dict:
+    """
+    Turn Reddit's [post_listing, comments_listing] JSON into our internal
+    {post, comments} structure. Robust to layout/consent-wall changes because
+    it reads structured data, not the rendered DOM.
+    """
+    if not isinstance(data, list) or len(data) < 2:
+        return {}
+
+    try:
+        pdata = data[0]["data"]["children"][0]["data"]
+    except (KeyError, IndexError, TypeError):
+        return {}
+
+    # Post media.
+    media = {"images": [], "video": None, "isGallery": False}
+    url_dest = pdata.get("url_overridden_by_dest") or pdata.get("url") or ""
+    if pdata.get("is_gallery") and pdata.get("media_metadata"):
+        for item in pdata["media_metadata"].values():
+            src = (item.get("s") or {}).get("u") or (item.get("s") or {}).get("gif")
+            if src:
+                media["images"].append(src.replace("&amp;", "&"))
+        media["isGallery"] = True
+    elif re.search(r"\.(jpg|jpeg|png|gif|webp)(\?|$)", url_dest, re.IGNORECASE) \
+            or re.search(r"(i\.redd\.it|i\.imgur\.com)", url_dest):
+        media["images"] = [url_dest]
+    if pdata.get("is_video") or "v.redd.it" in url_dest:
+        media["video"] = url_dest or "v.redd.it"
+
+    post = {
+        "title": pdata.get("title") or "",
+        "author": pdata.get("author") or "[deleted]",
+        "subreddit": pdata.get("subreddit_name_prefixed")
+                     or ("r/" + (pdata.get("subreddit") or "")),
+        "score": str(pdata.get("score", "")),
+        "when": _epoch_iso(pdata.get("created_utc")),
+        "selftext": pdata.get("selftext_html") or "",
+        "link": url_dest or post_url,
+        "permalink": "https://www.reddit.com" + (pdata.get("permalink") or ""),
+        "media": media,
+    }
+    # selftext_html is HTML-entity-escaped once; unescape so it renders.
+    if post["selftext"]:
+        import html as _h
+        post["selftext"] = _h.unescape(post["selftext"])
+
+    comments = _parse_comment_children(
+        data[1].get("data", {}).get("children", []))
+    return {"post": post, "comments": comments,
+            "_more": _collect_more_ids(data[1].get("data", {}).get("children", []))}
+
+
+def _epoch_iso(epoch) -> str:
+    if not epoch:
+        return ""
+    try:
+        from datetime import timezone
+        return datetime.fromtimestamp(float(epoch), tz=timezone.utc).isoformat()
+    except (ValueError, TypeError, OSError):
+        return ""
+
+
+def _parse_comment_children(children: list) -> list:
+    """Recursively parse a JSON comment listing into our comment dicts."""
+    out = []
+    for child in children or []:
+        if child.get("kind") != "t1":
+            continue  # skip 'more' stubs here; handled separately
+        d = child.get("data", {})
+        body_html = d.get("body_html") or ""
+        if body_html:
+            import html as _h
+            body_html = _h.unescape(body_html)
+        replies = []
+        rep = d.get("replies")
+        if isinstance(rep, dict):
+            replies = _parse_comment_children(
+                rep.get("data", {}).get("children", []))
+        out.append({
+            "author": d.get("author") or "[deleted]",
+            "score": str(d.get("score", "")) if d.get("score") is not None else "",
+            "when": _epoch_iso(d.get("created_utc")),
+            "body": body_html,
+            "images": [],
+            "deleted": d.get("author") in (None, "[deleted]"),
+            "replies": replies,
+        })
+    return out
+
+
+def _collect_more_ids(children: list) -> list:
+    """Gather IDs of 'more comments' stubs so we can fetch them too."""
+    more = []
+    for child in children or []:
+        if child.get("kind") == "more":
+            d = child.get("data", {})
+            more.extend(d.get("children", []))
+        elif child.get("kind") == "t1":
+            rep = child.get("data", {}).get("replies")
+            if isinstance(rep, dict):
+                more.extend(_collect_more_ids(
+                    rep.get("data", {}).get("children", [])))
+    return more
+
+
+def _merge_more_comments(page, post_url: str, data: dict, more_ids: list) -> None:
+    """
+    Fetch 'more comments' stubs in batches via Reddit's JSON and append the
+    extra top-level comments. Best-effort and capped so huge threads stay sane.
+    """
+    import json
+    link_id = data["post"].get("permalink", "")
+    m = POST_ID_RE.search(link_id) or POST_ID_RE.search(post_url)
+    if not m:
+        return
+    article = m.group(1)
+    ids = list(dict.fromkeys(more_ids))  # de-dupe, keep order
+    batches = 0
+    while ids and batches < 50:  # cap total batches
+        chunk, ids = ids[:100], ids[100:]
+        api = (f"https://www.reddit.com/api/morechildren.json?api_type=json"
+               f"&link_id=t3_{article}&children={','.join(chunk)}&raw_json=1")
+        try:
+            resp = page.request.get(api, timeout=45000)
+            if not resp.ok:
+                break
+            payload = json.loads(resp.text())
+            things = payload.get("json", {}).get("data", {}).get("things", [])
+        except Exception:  # noqa: BLE001
+            break
+        new_comments = _parse_comment_children(
+            [t for t in things if t.get("kind") == "t1"])
+        if new_comments:
+            data["comments"].extend(new_comments)
+        # queue any further 'more' stubs these returned
+        ids.extend(_collect_more_ids(things))
+        batches += 1
+
+
 def _load_expand_extract(page, target: str, *, is_main: bool):
     """
     Navigate to a thread (or 'continue this thread' sub-page), fully expand all
     in-page comments, and extract structured data. Returns (data, continue_urls)
     where continue_urls are sub-pages still to visit.
+
+    DOM-based fallback path (used only if JSON extraction fails).
     """
     try:
         page.goto(target, wait_until="domcontentloaded", timeout=45000)
@@ -525,43 +690,38 @@ def archive(url: str) -> Path:
             viewport={"width": 1280, "height": 2000},
         )
 
-        # Load + fully expand + extract the main thread page.
-        try:
-            data, continue_urls = _load_expand_extract(page, target,
-                                                        is_main=True)
-        except ArchiverError:
-            browser.close()
-            raise
+        # --- Primary path: fetch the thread JSON through the browser. ---
+        # This reads structured data, so it's immune to consent walls / layout
+        # changes that break DOM scraping (the cause of blank archives).
+        data = {}
+        raw = _browser_get_json(page, url)
+        if raw:
+            data = _parse_listing_json(raw, url)
 
-        # Follow every "continue this thread ->" sub-page and merge its
-        # comments in, so deeply-nested chains are captured too. We keep a
-        # visited set and a generous cap to avoid pathological loops.
-        visited: set[str] = {target}
-        queue = [u for u in continue_urls if u not in visited]
-        merged = 0
-        while queue and merged < 300:
-            sub_url = queue.pop(0)
-            if sub_url in visited:
-                continue
-            visited.add(sub_url)
+        # --- Fallback: DOM scraping (old behaviour) if JSON gave nothing. ---
+        if not data or not data.get("post") or not data["post"].get("title"):
             try:
-                sub_data, more_urls = _load_expand_extract(
-                    page, _old_reddit_url(sub_url), is_main=False)
-            except ArchiverError:
-                continue  # skip a sub-page that fails; keep the rest
-            if sub_data and sub_data.get("comments"):
-                data["comments"].extend(sub_data["comments"])
-            for u in more_urls:
-                if u not in visited:
-                    queue.append(u)
-            merged += 1
+                page.goto(target, wait_until="domcontentloaded", timeout=45000)
+                page.evaluate(_EXPAND_JS)
+                dom_data = page.evaluate(_EXTRACT_JS)
+                if dom_data and dom_data.get("post", {}).get("title"):
+                    data = dom_data
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Fetch any "more comments" stubs the first JSON page didn't inline, so
+        # we capture the complete tree even on large threads.
+        more_ids = (data or {}).get("_more", []) if isinstance(data, dict) else []
+        if data and data.get("post") and more_ids:
+            _merge_more_comments(page, url, data, more_ids)
 
         browser.close()
 
-    if not data or not data.get("post"):
+    if not data or not data.get("post") or not data["post"].get("title"):
         raise ArchiverError(
-            "No thread content found at that URL. Make sure it's a link to a "
-            "specific Reddit post (a /comments/ URL)."
+            "Couldn't read that thread. Either it's not a direct post link "
+            "(needs a /comments/ URL), the post was removed, or Reddit blocked "
+            "the request. Try again in a minute, or send me the link."
         )
 
     html_content = _render_page(data)
