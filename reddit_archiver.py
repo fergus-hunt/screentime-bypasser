@@ -18,13 +18,31 @@ friction — you deliberately archive a thread, then read the local copy.
 
 from __future__ import annotations
 
+import base64
+import mimetypes
 import re
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 import config
 
 POST_ID_RE = re.compile(r"/comments/([a-z0-9]+)", re.IGNORECASE)
+
+# Cap on how big a single embedded image may be (keeps HTML from ballooning).
+MAX_IMAGE_BYTES = 8 * 1024 * 1024  # 8 MB
+
+_IMG_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+}
+
+# Cache so the same image URL isn't downloaded twice within one archive run.
+_img_cache: dict[str, str] = {}
 
 
 class ArchiverError(RuntimeError):
@@ -62,27 +80,66 @@ def _import_playwright():
         ) from exc
 
 
-# JavaScript run inside the page to expand every collapsed comment / "load more".
-# old.reddit uses <span class="morecomments"> links and collapsed comments.
+# JavaScript run inside the page to expand EVERY collapsed comment and click
+# EVERY in-page "load more comments" link, until the thread fully stabilises.
+#
+# Two kinds of hidden comments on old.reddit:
+#   1. ".morecomments a"  -> in-page "load more comments (N replies)" links that
+#      fetch and inject more comments via AJAX. We click them all, repeatedly.
+#   2. ".morechildren" / "continue this thread ->" -> links to a SEPARATE page.
+#      Those can't be expanded in place; we collect their URLs and the Python
+#      side visits each one and merges the results (see _collect_continue_urls).
+#
+# The loop has no small round cap: it keeps going until a full pass finds
+# nothing left to click. A generous safety ceiling prevents a pathological
+# infinite loop, but it's high enough to fully load very large threads.
 _EXPAND_JS = r"""
 async () => {
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   let rounds = 0;
-  while (rounds < 40) {
-    // "load more comments" links
-    const more = Array.from(document.querySelectorAll('.morecomments a'));
-    // collapsed comment expanders
+  const MAX_ROUNDS = 400;          // safety ceiling, effectively unlimited
+  let idleAfterClicks = 0;
+  while (rounds < MAX_ROUNDS) {
+    // In-page "load more comments" links (NOT "continue this thread").
+    const more = Array.from(document.querySelectorAll('.morecomments a'))
+      .filter(a => !/continue this thread/i.test(a.textContent));
+    // Collapsed comment expanders still showing [+].
     const expanders = Array.from(document.querySelectorAll('.expand'))
       .filter(e => e.textContent.trim() === '[+]');
     const clickables = more.concat(expanders);
-    if (clickables.length === 0) break;
-    for (const el of clickables.slice(0, 25)) {
+
+    if (clickables.length === 0) {
+      // Nothing left to click — one more idle pass to be sure, then stop.
+      idleAfterClicks++;
+      if (idleAfterClicks >= 2) break;
+      await sleep(800);
+      rounds++;
+      continue;
+    }
+    idleAfterClicks = 0;
+
+    // Click them all this pass (not just a slice) so nothing is left behind.
+    for (const el of clickables) {
       try { el.click(); } catch (e) {}
     }
-    await sleep(1200);  // let new comments load in
+    // Wait for the AJAX-injected comments to land. Scale wait with batch size.
+    await sleep(Math.min(800 + clickables.length * 40, 4000));
     rounds++;
   }
   return rounds;
+}
+"""
+
+
+# Collect the "continue this thread ->" sub-page URLs that can't be expanded
+# in place. The Python side visits each, so deeply-nested chains are captured.
+_COLLECT_CONTINUE_JS = r"""
+() => {
+  const links = Array.from(document.querySelectorAll('.morecomments a, a'))
+    .filter(a => /continue this thread/i.test(a.textContent))
+    .map(a => a.href)
+    .filter(Boolean);
+  return Array.from(new Set(links));  // de-duplicate
 }
 """
 
@@ -96,9 +153,44 @@ _EXTRACT_JS = r"""
   const txt = (el) => el ? el.textContent.trim() : '';
   const htmlOf = (el) => el ? el.innerHTML : '';
 
+  // Collect <img> src URLs inside a container (inline images in bodies).
+  const imgsIn = (el) => el
+    ? Array.from(el.querySelectorAll('img'))
+        .map(i => i.src).filter(Boolean)
+    : [];
+
   // --- the post itself ---
   const top = document.querySelector('#siteTable .thing.link')
             || document.querySelector('.thing.link');
+
+  // Post media: image, gallery, or reddit video.
+  const postMedia = { images: [], video: null, isGallery: false };
+  if (top) {
+    // data-url is the linked media (i.redd.it image, v.redd.it video, etc.)
+    const dataUrl = top.getAttribute('data-url') || '';
+    // Gallery: old.reddit renders gallery tiles with .gallery-tile img or
+    // the post links to reddit.com/gallery/...
+    const galleryImgs = Array.from(
+      top.querySelectorAll('.media-gallery img, .gallery-tile img'))
+      .map(i => i.src).filter(Boolean);
+    if (galleryImgs.length) {
+      postMedia.images = galleryImgs;
+      postMedia.isGallery = true;
+    } else if (/\.(jpg|jpeg|png|gif|webp)(\?|$)/i.test(dataUrl)
+               || /(i\.redd\.it|i\.imgur\.com)/.test(dataUrl)) {
+      postMedia.images = [dataUrl];
+    }
+    // Reddit-hosted video.
+    if (/v\.redd\.it/.test(dataUrl) || top.classList.contains('has-video')) {
+      postMedia.video = dataUrl || top.getAttribute('data-url') || '';
+    }
+    // Any preview/expando image as a fallback.
+    if (!postMedia.images.length && !postMedia.video) {
+      const exp = imgsIn(top.querySelector('.expando'));
+      if (exp.length) postMedia.images = exp;
+    }
+  }
+
   const post = {
     title: txt(document.querySelector('a.title')) || document.title,
     author: txt(document.querySelector('.thing.link .author')),
@@ -111,6 +203,7 @@ _EXTRACT_JS = r"""
               htmlOf(document.querySelector('.thing.link .usertext-body .md')),
     link: (document.querySelector('a.title') || {}).href || location.href,
     permalink: location.href,
+    media: postMedia,
   };
 
   // --- recursively walk the comment tree ---
@@ -126,6 +219,7 @@ _EXTRACT_JS = r"""
     const when = timeEl ? timeEl.getAttribute('datetime') : '';
     const bodyEl = entry.querySelector('.usertext-body .md');
     const body = bodyEl ? bodyEl.innerHTML : '';
+    const images = imgsIn(bodyEl);  // inline images/gifs in the comment
     const deleted = node.classList.contains('deleted')
                  || node.classList.contains('collapsed');
 
@@ -140,7 +234,7 @@ _EXTRACT_JS = r"""
         }
       }
     }
-    return { author, score, when, body, deleted, replies };
+    return { author, score, when, body, images, deleted, replies };
   }
 
   const comments = [];
@@ -204,6 +298,9 @@ _STYLE = """
   .postbody { background: #fafafa; border: 1px solid #eee; border-radius: 8px;
               padding: .2rem 1rem; margin-bottom: 1.4rem; }
   .postbody img, .cbody img { max-width: 100%; height: auto; border-radius: 6px; }
+  .postimg { display: block; margin: .6rem 0; max-width: 100%; }
+  video { max-width: 100%; border-radius: 8px; margin: .6rem 0; }
+  .videolink { display: inline-block; margin: .4rem 0; }
   h2.section { font-size: 1rem; color: #555; border-top: 1px solid #eee;
                padding-top: 1rem; }
   .comment { margin-left: calc(var(--depth) * 14px); border-left: 2px solid #e6e6e6;
@@ -230,6 +327,70 @@ _STYLE = """
 """
 
 
+def _fetch_image_data_uri(url: str) -> str | None:
+    """
+    Download an image and return a base64 data: URI so it embeds in the HTML
+    and works fully offline. Returns None if it can't be fetched.
+    """
+    if not url or url.startswith("data:"):
+        return url or None
+    if url in _img_cache:
+        return _img_cache[url]
+    try:
+        req = urllib.request.Request(url, headers=_IMG_HEADERS)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            ctype = resp.headers.get("Content-Type", "").split(";")[0].strip()
+            data = resp.read(MAX_IMAGE_BYTES + 1)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError):
+        return None
+    if len(data) > MAX_IMAGE_BYTES:
+        return None  # too big to embed
+    if not ctype or not ctype.startswith("image"):
+        guessed, _ = mimetypes.guess_type(url)
+        ctype = guessed or "image/jpeg"
+    b64 = base64.b64encode(data).decode("ascii")
+    uri = f"data:{ctype};base64,{b64}"
+    _img_cache[url] = uri
+    return uri
+
+
+def _embed_images_in_html(body_html: str) -> str:
+    """Replace every <img src> in a body fragment with an embedded data URI."""
+    def _replace(match: re.Match) -> str:
+        src = match.group(1)
+        uri = _fetch_image_data_uri(src)
+        if uri:
+            return f'src="{uri}"'
+        return match.group(0)  # leave original if fetch failed
+    return re.sub(r'src="([^"]+)"', _replace, body_html or "")
+
+
+def _media_block(media: dict) -> str:
+    """Render the post's primary media (images/gallery/video) as embedded HTML."""
+    if not media:
+        return ""
+    parts = []
+    video = media.get("video")
+    if video:
+        # Video is downloaded separately (see archive()); placeholder filled later.
+        parts.append(f'<!--VIDEO:{_esc(video)}-->')
+    for img_url in media.get("images", []):
+        uri = _fetch_image_data_uri(img_url)
+        if uri:
+            parts.append(f'<img class="postimg" src="{uri}" '
+                         f'alt="post image" loading="lazy">')
+    return "".join(parts)
+
+
+def _embed_comment_images(comments: list) -> None:
+    """In-place: embed inline images in every comment body."""
+    for c in comments:
+        if c.get("body"):
+            c["body"] = _embed_images_in_html(c["body"])
+        if c.get("replies"):
+            _embed_comment_images(c["replies"])
+
+
 def _count_comments(comments: list) -> int:
     return sum(1 + _count_comments(c.get("replies", [])) for c in comments)
 
@@ -247,18 +408,23 @@ def _render_page(data: dict) -> str:
     when = _esc(_fmt_iso(post.get("when", "")))
     permalink = _esc(post.get("permalink") or post.get("link") or "")
 
-    # Post body: selftext if present, else the external link / image.
+    # Post body: selftext (with embedded inline images), the post's media
+    # (images/gallery/video), and any external link.
     body_parts = []
     if post.get("selftext"):
-        body_parts.append(post["selftext"])
+        body_parts.append(_embed_images_in_html(post["selftext"]))
+    body_parts.append(_media_block(post.get("media") or {}))
     link = post.get("link") or ""
-    if link and not post.get("selftext"):
-        if re.search(r"\.(jpg|jpeg|png|gif|webp)(\?|$)", link, re.IGNORECASE):
-            body_parts.append(f'<img src="{_esc(link)}" alt="post image" loading="lazy">')
-        elif "reddit.com" not in link:
-            body_parts.append(f'<p><a href="{_esc(link)}">{_esc(link)}</a></p>')
-    post_body = "".join(body_parts) or '<p class="empty">(text post — no body)</p>'
+    has_media = bool((post.get("media") or {}).get("images")
+                     or (post.get("media") or {}).get("video"))
+    if link and not post.get("selftext") and not has_media \
+            and "reddit.com" not in link:
+        body_parts.append(f'<p><a href="{_esc(link)}">{_esc(link)}</a></p>')
+    post_body = "".join(p for p in body_parts if p) \
+        or '<p class="empty">(text post — no body)</p>'
 
+    # Embed inline images in comment bodies so they work offline.
+    _embed_comment_images(comments)
     comments_html = "".join(_render_comment(c) for c in comments) \
         or '<p class="empty">No comments archived.</p>'
     n = _count_comments(comments)
@@ -286,10 +452,54 @@ def _slugify(text: str, maxlen: int = 80) -> str:
     return slug[:maxlen] or "reddit-thread"
 
 
+def _load_expand_extract(page, target: str, *, is_main: bool):
+    """
+    Navigate to a thread (or 'continue this thread' sub-page), fully expand all
+    in-page comments, and extract structured data. Returns (data, continue_urls)
+    where continue_urls are sub-pages still to visit.
+    """
+    try:
+        page.goto(target, wait_until="domcontentloaded", timeout=45000)
+    except Exception as exc:  # noqa: BLE001
+        if is_main:
+            raise ArchiverError(
+                f"Could not load the thread ({exc}).\n"
+                "  Check the URL and your Pi's internet connection."
+            ) from exc
+        raise ArchiverError(str(exc)) from exc
+
+    # Expand every collapsed comment / in-page "load more" link until stable.
+    try:
+        page.evaluate(_EXPAND_JS)
+    except Exception:  # noqa: BLE001
+        pass  # best-effort; extract whatever loaded
+
+    try:
+        data = page.evaluate(_EXTRACT_JS)
+    except Exception as exc:  # noqa: BLE001
+        if is_main:
+            raise ArchiverError(
+                f"Loaded the page but couldn't extract the thread ({exc}).\n"
+                "  Reddit may have changed its layout — let me know and I'll fix it."
+            ) from exc
+        return {}, []
+
+    try:
+        continue_urls = page.evaluate(_COLLECT_CONTINUE_JS) or []
+    except Exception:  # noqa: BLE001
+        continue_urls = []
+
+    return data, continue_urls
+
+
 def archive(url: str) -> Path:
     """
     Archive a Reddit thread to a self-contained offline HTML file using a
     headless browser. Returns the path to the saved file.
+
+    Captures *every* comment: it expands all in-page "load more" links until the
+    page stabilises, then follows each "continue this thread ->" sub-page and
+    merges those comments in too.
     """
     config.MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     sync_playwright = _import_playwright()
@@ -314,30 +524,38 @@ def archive(url: str) -> Path:
             ),
             viewport={"width": 1280, "height": 2000},
         )
-        try:
-            page.goto(target, wait_until="domcontentloaded", timeout=45000)
-        except Exception as exc:  # noqa: BLE001
-            browser.close()
-            raise ArchiverError(
-                f"Could not load the thread ({exc}).\n"
-                "  Check the URL and your Pi's internet connection."
-            ) from exc
 
-        # Expand all collapsed comments / "load more" links first.
+        # Load + fully expand + extract the main thread page.
         try:
-            page.evaluate(_EXPAND_JS)
-        except Exception:  # noqa: BLE001
-            pass  # best-effort; extract whatever loaded
-
-        # Extract the thread as structured data, then render our own clean page.
-        try:
-            data = page.evaluate(_EXTRACT_JS)
-        except Exception as exc:  # noqa: BLE001
+            data, continue_urls = _load_expand_extract(page, target,
+                                                        is_main=True)
+        except ArchiverError:
             browser.close()
-            raise ArchiverError(
-                f"Loaded the page but couldn't extract the thread ({exc}).\n"
-                "  Reddit may have changed its layout — let me know and I'll update."
-            ) from exc
+            raise
+
+        # Follow every "continue this thread ->" sub-page and merge its
+        # comments in, so deeply-nested chains are captured too. We keep a
+        # visited set and a generous cap to avoid pathological loops.
+        visited: set[str] = {target}
+        queue = [u for u in continue_urls if u not in visited]
+        merged = 0
+        while queue and merged < 300:
+            sub_url = queue.pop(0)
+            if sub_url in visited:
+                continue
+            visited.add(sub_url)
+            try:
+                sub_data, more_urls = _load_expand_extract(
+                    page, _old_reddit_url(sub_url), is_main=False)
+            except ArchiverError:
+                continue  # skip a sub-page that fails; keep the rest
+            if sub_data and sub_data.get("comments"):
+                data["comments"].extend(sub_data["comments"])
+            for u in more_urls:
+                if u not in visited:
+                    queue.append(u)
+            merged += 1
+
         browser.close()
 
     if not data or not data.get("post"):
@@ -347,6 +565,11 @@ def archive(url: str) -> Path:
         )
 
     html_content = _render_page(data)
+
+    # If the post is a Reddit-hosted video, download it (merged with audio) via
+    # the existing downloader and swap the placeholder for an inline player.
+    html_content = _attach_video(html_content, url)
+
     title = data["post"].get("title") or "reddit-thread"
     post_id = POST_ID_RE.search(url)
     pid = post_id.group(1) if post_id else "thread"
@@ -357,3 +580,38 @@ def archive(url: str) -> Path:
     out = config.MEDIA_DIR / fname
     out.write_text(html_content, encoding="utf-8")
     return out
+
+
+def _attach_video(html_content: str, post_url: str) -> str:
+    """
+    Replace the <!--VIDEO:...--> placeholder with a real <video> player by
+    downloading the Reddit video (with audio) via yt-dlp. Falls back to a link
+    if the download isn't possible.
+    """
+    m = re.search(r"<!--VIDEO:(.*?)-->", html_content)
+    if not m:
+        return html_content
+
+    try:
+        import downloader  # local module; uses yt-dlp + ffmpeg
+        # Download the *post* URL (yt-dlp resolves the v.redd.it video+audio).
+        files = downloader.download(post_url, no_playlist=True)
+    except Exception:  # noqa: BLE001
+        files = []
+
+    video_file = next((f for f in files
+                       if f.suffix.lower() in (".mp4", ".webm", ".mkv")), None)
+    if video_file and video_file.exists():
+        # The HTML lives in the same media folder, so a relative src works both
+        # on disk and when served by the local web server.
+        import urllib.parse
+        src = urllib.parse.quote(video_file.name)
+        player = (f'<video controls preload="metadata" src="{src}"></video>'
+                  f'<div><a class="videolink" href="{src}" download>'
+                  f'&#11015; download video ({video_file.name})</a></div>')
+    else:
+        live = _esc(m.group(1)) or _esc(post_url)
+        player = (f'<p class="empty">[video could not be downloaded — '
+                  f'<a href="{live}">view on Reddit</a>]</p>')
+
+    return html_content.replace(m.group(0), player)
