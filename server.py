@@ -186,8 +186,8 @@ class MediaHandler(SimpleHTTPRequestHandler):
                 link = f'<a href="{href}" download>💾 {display}</a>'
                 
             actions = (
-                f'<button onclick="renameFile(\\'{html.escape(rel_path)}\\')" class="action-btn" title="Rename">✏️</button>'
-                f'<button onclick="deleteFile(\\'{html.escape(rel_path)}\\')" class="action-btn delete-btn" title="Delete">🗑️</button>'
+                f'<button onclick="renameFile(\'{html.escape(rel_path)}\')" class="action-btn" title="Rename">✏️</button>'
+                f'<button onclick="deleteFile(\'{html.escape(rel_path)}\')" class="action-btn delete-btn" title="Delete">🗑️</button>'
             )
             rows.append(f'<tr data-search="{html.escape(rel_path.lower())}"><td>{link}</td><td class="actions">{actions}</td><td class="size">{size}</td></tr>')
 
