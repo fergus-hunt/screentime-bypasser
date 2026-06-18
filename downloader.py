@@ -51,7 +51,7 @@ def _format_string() -> str:
     if height:
         return (
             f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
-            f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best"
+            f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
         )
     return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
 
