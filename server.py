@@ -41,6 +41,69 @@ def _human_size(num: float) -> str:
 class MediaHandler(SimpleHTTPRequestHandler):
     """Serves files from MEDIA_DIR with a friendly index page."""
 
+    def do_GET(self):
+        if self.path.startswith("/api/grab"):
+            self.handle_grab()
+            return
+        super().do_GET()
+
+    def handle_grab(self):
+        import json
+        import app
+        import downloader
+        import reddit_archiver
+
+        parsed = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(parsed.query)
+        url = qs.get("url", [""])[0]
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        if not url:
+            self.wfile.write(b"data: " + json.dumps({"status": "error", "error": "Missing URL"}).encode("utf-8") + b"\n\n")
+            return
+
+        def sse_progress(d):
+            try:
+                import re
+                def clean(s):
+                    return re.sub(r'\x1b\[[0-9;]*m', '', str(s)) if s else ""
+                
+                if d.get("status") == "downloading":
+                    data = {
+                        "status": "downloading",
+                        "percent_str": clean(d.get("_percent_str", "")).strip(),
+                        "speed_str": clean(d.get("_speed_str", "")).strip(),
+                        "eta_str": clean(d.get("_eta_str", "")).strip(),
+                    }
+                    self.wfile.write(b"data: " + json.dumps(data).encode("utf-8") + b"\n\n")
+                    self.wfile.flush()
+                elif d.get("status") == "finished":
+                    self.wfile.write(b"data: " + json.dumps({"status": "finished"}).encode("utf-8") + b"\n\n")
+                    self.wfile.flush()
+            except Exception:
+                pass
+
+        try:
+            kind = downloader.classify(url)
+            if kind == "reddit" and reddit_archiver.is_reddit_thread(url):
+                self.wfile.write(b"data: " + json.dumps({"status": "archiving"}).encode("utf-8") + b"\n\n")
+                self.wfile.flush()
+                
+            app.cmd_download([url], audio=False, no_playlist=False, progress_hook=sse_progress)
+            self.wfile.write(b"data: " + json.dumps({"status": "done"}).encode("utf-8") + b"\n\n")
+            self.wfile.flush()
+        except Exception as e:
+            try:
+                self.wfile.write(b"data: " + json.dumps({"status": "error", "error": str(e)}).encode("utf-8") + b"\n\n")
+                self.wfile.flush()
+            except Exception:
+                pass
+
     def list_directory(self, path):  # noqa: D401 - override
         try:
             entries = sorted(
@@ -73,14 +136,77 @@ class MediaHandler(SimpleHTTPRequestHandler):
   body {{ font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 760px;
           padding: 0 1rem; color: #1a1a1a; }}
   h1 {{ font-size: 1.4rem; }}
+  .grab-form {{ display: flex; gap: 0.5rem; margin-bottom: 1.5rem; }}
+  .grab-form input[type="url"] {{ flex: 1; padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; }}
+  .grab-form button {{ padding: 0.5rem 1rem; background: #0b6; color: white; border: none; border-radius: 4px; cursor: pointer; }}
+  .grab-form button:hover {{ background: #095; }}
+  #progress-container {{ display: none; margin-bottom: 1.5rem; }}
+  progress {{ width: 100%; height: 20px; }}
+  #progress-text {{ font-size: 0.9rem; color: #555; text-align: center; margin-top: 0.25rem; }}
   table {{ width: 100%; border-collapse: collapse; }}
   td {{ padding: .55rem .4rem; border-bottom: 1px solid #eee; }}
   td.size {{ text-align: right; color: #777; white-space: nowrap; }}
   a {{ text-decoration: none; color: #0b6; word-break: break-all; }}
   a:hover {{ text-decoration: underline; }}
   .empty {{ color: #777; }}
-</style></head><body>
+</style>
+<script>
+  function grabUrl(event) {{
+    event.preventDefault();
+    const urlInput = document.getElementById("url-input");
+    const url = urlInput.value;
+    if (!url) return;
+    
+    urlInput.disabled = true;
+    document.querySelector(".grab-form button").disabled = true;
+    
+    const pc = document.getElementById("progress-container");
+    const pbar = document.getElementById("progress-bar");
+    const ptext = document.getElementById("progress-text");
+    pc.style.display = "block";
+    pbar.removeAttribute("value");
+    ptext.innerText = "Starting download...";
+    
+    const es = new EventSource("/api/grab?url=" + encodeURIComponent(url));
+    es.onmessage = function(e) {{
+      const data = JSON.parse(e.data);
+      if (data.status === "downloading") {{
+        ptext.innerText = data.percent_str + " - " + data.speed_str + " - ETA: " + data.eta_str;
+        let pct = parseFloat(data.percent_str);
+        if (!isNaN(pct)) pbar.value = pct;
+      }} else if (data.status === "finished") {{
+        pbar.value = 100;
+        ptext.innerText = "Done, post-processing...";
+      }} else if (data.status === "done") {{
+        es.close();
+        window.location.reload();
+      }} else if (data.status === "error") {{
+        es.close();
+        ptext.innerText = "Error: " + data.error;
+        urlInput.disabled = false;
+        document.querySelector(".grab-form button").disabled = false;
+      }} else if (data.status === "archiving") {{
+        ptext.innerText = "Archiving Reddit thread...";
+      }}
+    }};
+    es.onerror = function(e) {{
+      es.close();
+      ptext.innerText = "Connection lost.";
+      urlInput.disabled = false;
+      document.querySelector(".grab-form button").disabled = false;
+    }};
+  }}
+</script>
+</head><body>
 <h1>Pi Media &mdash; {len(entries)} file(s)</h1>
+<form class="grab-form" onsubmit="grabUrl(event)">
+  <input type="url" id="url-input" placeholder="Paste YouTube or Reddit link here..." required>
+  <button type="submit">Grab</button>
+</form>
+<div id="progress-container">
+  <progress id="progress-bar" max="100"></progress>
+  <div id="progress-text"></div>
+</div>
 <table>{''.join(rows) or '<tr><td class="empty">Nothing downloaded yet.</td></tr>'}</table>
 </body></html>"""
 

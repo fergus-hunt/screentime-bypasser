@@ -49,7 +49,7 @@ def _progress(d):
 
 
 def cmd_download(links: list[str], audio: bool, no_playlist: bool,
-                 force_media: bool = False) -> list[Path]:
+                 force_media: bool = False, progress_hook=None) -> list[Path]:
     all_files: list[Path] = []
     for url in links:
         kind = downloader.classify(url)
@@ -78,7 +78,7 @@ def cmd_download(links: list[str], audio: bool, no_playlist: bool,
         try:
             files = downloader.download(
                 url, audio_only=audio, no_playlist=no_playlist,
-                progress_hook=_progress,
+                progress_hook=progress_hook or _progress,
             )
         except Exception as exc:  # noqa: BLE001
             print(f"  ERROR: {exc}")
