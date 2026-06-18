@@ -56,8 +56,11 @@ def _format_string() -> str:
     return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
 
 
-def _build_opts(progress_hook=None) -> dict:
-    config.MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+def _build_opts(url: str | None = None, progress_hook=None) -> dict:
+    kind = classify(url) if url else "other"
+    subdir = kind if kind in ("youtube", "reddit") else ""
+    out_dir = config.MEDIA_DIR / subdir if subdir else config.MEDIA_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     postprocessors = [
         # Ensure the final container is mp4.
@@ -69,7 +72,7 @@ def _build_opts(progress_hook=None) -> dict:
     opts = {
         "format": _format_string(),
         "merge_output_format": config.CONTAINER,
-        "outtmpl": str(config.MEDIA_DIR / config.OUTPUT_TEMPLATE),
+        "outtmpl": str(out_dir / config.OUTPUT_TEMPLATE),
         "postprocessors": postprocessors,
         "noplaylist": False,        # allow playlists, but see --no-playlist flag
         "ignoreerrors": False,
@@ -92,7 +95,7 @@ def download(url: str, *, audio_only: bool = False, no_playlist: bool = False,
     Download a single URL. Returns the list of resulting file paths.
     """
     _check_ffmpeg()
-    opts = _build_opts(progress_hook=progress_hook)
+    opts = _build_opts(url=url, progress_hook=progress_hook)
 
     if no_playlist:
         opts["noplaylist"] = True

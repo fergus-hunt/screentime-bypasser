@@ -41,6 +41,57 @@ def _human_size(num: float) -> str:
 class MediaHandler(SimpleHTTPRequestHandler):
     """Serves files from MEDIA_DIR with a friendly index page."""
 
+    def do_DELETE(self):
+        if self.path.startswith("/api/file"):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            target = qs.get("target", [""])[0]
+            if not target:
+                self.send_error(400, "Missing target")
+                return
+            
+            p = (config.MEDIA_DIR / target).resolve()
+            if not p.is_relative_to(config.MEDIA_DIR.resolve()) or not p.exists():
+                self.send_error(403, "Invalid target")
+                return
+            
+            try:
+                p.unlink()
+                self.send_response(200)
+                self.end_headers()
+            except Exception as e:
+                self.send_error(500, str(e))
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        if self.path.startswith("/api/rename"):
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length).decode('utf-8')
+            import json
+            try:
+                data = json.loads(body)
+                old_path = data['old']
+                new_path = data['new']
+                
+                p_old = (config.MEDIA_DIR / old_path).resolve()
+                p_new = (config.MEDIA_DIR / new_path).resolve()
+                
+                if not p_old.is_relative_to(config.MEDIA_DIR.resolve()) or not p_old.exists():
+                    self.send_error(403, "Invalid old target")
+                    return
+                if not p_new.is_relative_to(config.MEDIA_DIR.resolve()):
+                    self.send_error(403, "Invalid new target")
+                    return
+                
+                p_new.parent.mkdir(parents=True, exist_ok=True)
+                p_old.rename(p_new)
+                self.send_response(200)
+                self.end_headers()
+            except Exception as e:
+                self.send_error(500, str(e))
+        else:
+            self.send_error(404)
+
     def do_GET(self):
         if self.path.startswith("/api/grab"):
             self.handle_grab()
@@ -105,10 +156,11 @@ class MediaHandler(SimpleHTTPRequestHandler):
                 pass
 
     def list_directory(self, path):  # noqa: D401 - override
+        media_dir = config.MEDIA_DIR.resolve()
         try:
             entries = sorted(
-                (p for p in __import__("os").scandir(path) if p.is_file()),
-                key=lambda e: e.name.lower(),
+                (p for p in media_dir.rglob('*') if p.is_file() and not p.name.startswith('.')),
+                key=lambda e: str(e.relative_to(media_dir)).lower()
             )
         except OSError:
             self.send_error(404, "No permission to list directory")
@@ -116,17 +168,28 @@ class MediaHandler(SimpleHTTPRequestHandler):
 
         rows = []
         for e in entries:
-            display = html.escape(e.name)              # safe to show as text
+            rel_path = str(e.relative_to(media_dir))
+            display = html.escape(rel_path)              # safe to show as text
             # URL-encode the href so spaces, brackets etc. don't 404.
-            href = urllib.parse.quote(e.name)
+            href = "/" + "/".join(urllib.parse.quote(part) for part in rel_path.split("/"))
             size = _human_size(e.stat().st_size)
             # Archived Reddit threads (.html) open in the browser to read;
-            # everything else is offered as a download.
-            if e.name.lower().endswith((".html", ".htm")):
+            # videos play natively; everything else is offered as a download.
+            is_html = e.name.lower().endswith((".html", ".htm"))
+            is_video = e.name.lower().endswith((".mp4", ".webm", ".mkv"))
+            
+            if is_html:
                 link = f'<a href="{href}">📄 {display}</a>'
+            elif is_video:
+                link = f'<a href="{href}">🎬 {display}</a>'
             else:
-                link = f'<a href="{href}" download>{display}</a>'
-            rows.append(f'<tr><td>{link}</td><td class="size">{size}</td></tr>')
+                link = f'<a href="{href}" download>💾 {display}</a>'
+                
+            actions = (
+                f'<button onclick="renameFile(\\'{html.escape(rel_path)}\\')" class="action-btn" title="Rename">✏️</button>'
+                f'<button onclick="deleteFile(\\'{html.escape(rel_path)}\\')" class="action-btn delete-btn" title="Delete">🗑️</button>'
+            )
+            rows.append(f'<tr data-search="{html.escape(rel_path.lower())}"><td>{link}</td><td class="actions">{actions}</td><td class="size">{size}</td></tr>')
 
         body = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -136,7 +199,9 @@ class MediaHandler(SimpleHTTPRequestHandler):
   body {{ font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 760px;
           padding: 0 1rem; color: #1a1a1a; }}
   h1 {{ font-size: 1.4rem; }}
-  .grab-form {{ display: flex; gap: 0.5rem; margin-bottom: 1.5rem; }}
+  .grab-form {{ display: flex; gap: 0.5rem; margin-bottom: 1rem; }}
+  .search-form {{ display: flex; gap: 0.5rem; margin-bottom: 1.5rem; }}
+  .search-form input[type="text"] {{ flex: 1; padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; }}
   .grab-form input[type="url"] {{ flex: 1; padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; }}
   .grab-form button {{ padding: 0.5rem 1rem; background: #0b6; color: white; border: none; border-radius: 4px; cursor: pointer; }}
   .grab-form button:hover {{ background: #095; }}
@@ -146,11 +211,47 @@ class MediaHandler(SimpleHTTPRequestHandler):
   table {{ width: 100%; border-collapse: collapse; }}
   td {{ padding: .55rem .4rem; border-bottom: 1px solid #eee; }}
   td.size {{ text-align: right; color: #777; white-space: nowrap; }}
+  td.actions {{ text-align: right; white-space: nowrap; width: 80px; }}
+  .action-btn {{ background: none; border: none; cursor: pointer; opacity: 0.6; font-size: 1.1rem; padding: 0 4px; }}
+  .action-btn:hover {{ opacity: 1; }}
+  .delete-btn:hover {{ color: red; }}
   a {{ text-decoration: none; color: #0b6; word-break: break-all; }}
   a:hover {{ text-decoration: underline; }}
   .empty {{ color: #777; }}
 </style>
 <script>
+  function filterFiles() {{
+    const q = document.getElementById("search-input").value.toLowerCase();
+    document.querySelectorAll("tr[data-search]").forEach(tr => {{
+      tr.style.display = tr.dataset.search.includes(q) ? "" : "none";
+    }});
+  }}
+
+  async function deleteFile(path) {{
+    if (!confirm(`Delete ${{path}}?`)) return;
+    const res = await fetch("/api/file?target=" + encodeURIComponent(path), {{ method: "DELETE" }});
+    if (res.ok) window.location.reload();
+    else alert("Error deleting: " + await res.text());
+  }}
+
+  async function renameFile(oldPath) {{
+    const parts = oldPath.split('/');
+    const oldName = parts.pop();
+    const newName = prompt("Enter new name:", oldName);
+    if (!newName || newName === oldName) return;
+    
+    parts.push(newName);
+    const newPath = parts.join('/');
+    
+    const res = await fetch("/api/rename", {{
+      method: "POST",
+      headers: {{ "Content-Type": "application/json" }},
+      body: JSON.stringify({{ old: oldPath, new: newPath }})
+    }});
+    if (res.ok) window.location.reload();
+    else alert("Error renaming: " + await res.text());
+  }}
+
   function grabUrl(event) {{
     event.preventDefault();
     const urlInput = document.getElementById("url-input");
@@ -199,6 +300,9 @@ class MediaHandler(SimpleHTTPRequestHandler):
 </script>
 </head><body>
 <h1>Pi Media &mdash; {len(entries)} file(s)</h1>
+<div class="search-form">
+  <input type="text" id="search-input" placeholder="Search files..." onkeyup="filterFiles()">
+</div>
 <form class="grab-form" onsubmit="grabUrl(event)">
   <input type="url" id="url-input" placeholder="Paste YouTube or Reddit link here..." required>
   <button type="submit">Grab</button>

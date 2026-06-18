@@ -737,7 +737,9 @@ def archive(url: str) -> Path:
     # No brackets/spaces in the filename — they break download URLs (the [id]
     # was causing 404s when the file was fetched through the web server).
     fname = f"reddit-{_slugify(title, maxlen=70)}-{pid}.html"
-    out = config.MEDIA_DIR / fname
+    out_dir = config.MEDIA_DIR / "reddit"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / fname
     out.write_text(html_content, encoding="utf-8")
     return out
 
