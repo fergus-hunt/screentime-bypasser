@@ -6,3 +6,4 @@ venv/
 
 # Downloaded media
 media/
+__pycache__/
